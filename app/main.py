@@ -13,7 +13,7 @@ BASE = Path(__file__).resolve().parent.parent
 DATA = Path(os.environ.get("KEEPERCOACH_DATA_DIR", str(BASE / "data")))
 UPLOADS = DATA / "uploads"
 DB = DATA / "keepercoach.db"
-STATIC = Path(__file__).resolve().parent / 
+STATIC = Path(__file__).resolve().parent 
 DATA.mkdir(exist_ok=True); UPLOADS.mkdir(exist_ok=True)
 
 app = FastAPI(title="KeeperCoach MVP", version="1.0.0")
