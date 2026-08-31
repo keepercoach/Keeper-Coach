@@ -5,7 +5,8 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, BackgroundTasks, Depends, File, Form, Header, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
+import boto3
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -72,6 +73,22 @@ def db():
 
 def now(): return datetime.now(timezone.utc).isoformat()
 def uid(): return uuid.uuid4().hex
+
+def bucket_configured():
+    return all(os.environ.get(name) for name in ('AWS_ACCESS_KEY_ID','AWS_SECRET_ACCESS_KEY','AWS_ENDPOINT_URL','AWS_S3_BUCKET_NAME'))
+
+def s3_client():
+    if not bucket_configured(): raise RuntimeError('Video storage bucket is not configured')
+    return boto3.client('s3',endpoint_url=os.environ['AWS_ENDPOINT_URL'],region_name=os.environ.get('AWS_DEFAULT_REGION','auto'))
+
+def s3_key(match_id, ext): return f"matches/{match_id}/footage{ext}"
+def is_s3_path(path): return bool(path and path.startswith('s3:'))
+def object_key(path): return path[3:] if is_s3_path(path) else None
+
+def video_source(path):
+    if is_s3_path(path):
+        return s3_client().generate_presigned_url('get_object',Params={'Bucket':os.environ['AWS_S3_BUCKET_NAME'],'Key':object_key(path)},ExpiresIn=3600)
+    return str(UPLOADS/Path(path).name)
 
 def hash_password(password: str, salt: Optional[bytes]=None) -> str:
     salt = salt or secrets.token_bytes(16)
@@ -197,12 +214,14 @@ def create_match(x:MatchIn,user=Depends(get_user)):
 @app.delete('/api/matches/{match_id}')
 def delete_match(match_id:str,user=Depends(get_user)):
     video_file = None
+    video_key = None
     with db() as con:
         match = match_owned(con,match_id,user['id'])
         if match['video_path']:
-            candidate = (UPLOADS / Path(match['video_path']).name).resolve()
-            if candidate.parent == UPLOADS.resolve():
-                video_file = candidate
+            if is_s3_path(match['video_path']): video_key=object_key(match['video_path'])
+            else:
+                candidate = (UPLOADS / Path(match['video_path']).name).resolve()
+                if candidate.parent == UPLOADS.resolve(): video_file = candidate
         # Events are removed by the foreign-key cascade in the same transaction.
         con.execute("DELETE FROM matches WHERE id=?",(match_id,))
     if video_file:
@@ -212,6 +231,9 @@ def delete_match(match_id:str,user=Depends(get_user)):
             # The match is already safely deleted; a storage cleanup failure should
             # not make the client retry a destructive operation.
             pass
+    if video_key:
+        try: s3_client().delete_object(Bucket=os.environ['AWS_S3_BUCKET_NAME'],Key=video_key)
+        except Exception: pass
     return {'ok':True}
 
 def video_duration(path:Path):
@@ -233,32 +255,55 @@ def start_video_upload(match_id:str,x:VideoUploadStart,user=Depends(get_user)):
     if x.size<=0 or x.size>max_bytes: raise HTTPException(413,f'Video exceeds the {max_bytes//(1024*1024)} MB upload limit')
     with db() as con: match_owned(con,match_id,user['id'])
     upload_id=uid(); part,meta=upload_paths(match_id,upload_id)
-    part.write_bytes(b'')
-    meta.write_text(json.dumps({'filename':x.filename,'size':x.size,'ext':ext}),encoding='utf-8')
+    details={'filename':x.filename,'size':x.size,'ext':ext,'uploaded':0,'parts':[]}
+    if bucket_configured():
+        key=s3_key(match_id,ext)
+        result=s3_client().create_multipart_upload(Bucket=os.environ['AWS_S3_BUCKET_NAME'],Key=key,ContentType='video/mp4')
+        details.update({'storage':'s3','key':key,'s3_upload_id':result['UploadId']})
+    else:
+        part.write_bytes(b''); details['storage']='local'
+    meta.write_text(json.dumps(details),encoding='utf-8')
     return {'upload_id':upload_id,'uploaded':0}
 
 @app.post('/api/matches/{match_id}/video/chunk/{upload_id}')
 async def upload_video_chunk(match_id:str,upload_id:str,request:Request,offset:int,user=Depends(get_user)):
     with db() as con: match_owned(con,match_id,user['id'])
     part,meta_path=upload_paths(match_id,upload_id)
-    if not part.exists() or not meta_path.exists(): raise HTTPException(404,'Upload session not found')
+    if not meta_path.exists(): raise HTTPException(404,'Upload session not found')
     meta=json.loads(meta_path.read_text(encoding='utf-8'))
-    current=part.stat().st_size
+    current=int(meta.get('uploaded',0)) if meta.get('storage')=='s3' else part.stat().st_size
     if offset!=current: raise HTTPException(409,detail={'message':'Upload offset changed','uploaded':current})
-    with part.open('ab') as out:
-        async for chunk in request.stream():
-            if current+len(chunk)>meta['size']:
-                raise HTTPException(413,'Upload exceeds expected file size')
-            out.write(chunk); current+=len(chunk)
+    body=await request.body()
+    if current+len(body)>meta['size']: raise HTTPException(413,'Upload exceeds expected file size')
+    if meta.get('storage')=='s3':
+        part_number=len(meta['parts'])+1
+        result=s3_client().upload_part(Bucket=os.environ['AWS_S3_BUCKET_NAME'],Key=meta['key'],UploadId=meta['s3_upload_id'],PartNumber=part_number,Body=body)
+        meta['parts'].append({'ETag':result['ETag'],'PartNumber':part_number}); current+=len(body); meta['uploaded']=current
+        meta_path.write_text(json.dumps(meta),encoding='utf-8')
+    else:
+        with part.open('ab') as out: out.write(body)
+        current+=len(body)
     return {'uploaded':current}
 
 @app.post('/api/matches/{match_id}/video/complete/{upload_id}')
 def complete_video_upload(match_id:str,upload_id:str,user=Depends(get_user)):
     with db() as con: match=match_owned(con,match_id,user['id'])
     part,meta_path=upload_paths(match_id,upload_id)
-    if not part.exists() or not meta_path.exists(): raise HTTPException(404,'Upload session not found')
+    if not meta_path.exists(): raise HTTPException(404,'Upload session not found')
     meta=json.loads(meta_path.read_text(encoding='utf-8'))
-    if part.stat().st_size!=meta['size']: raise HTTPException(400,'Upload is incomplete')
+    uploaded=int(meta.get('uploaded',0)) if meta.get('storage')=='s3' else part.stat().st_size
+    if uploaded!=meta['size']: raise HTTPException(400,'Upload is incomplete')
+    if meta.get('storage')=='s3':
+        s3_client().complete_multipart_upload(Bucket=os.environ['AWS_S3_BUCKET_NAME'],Key=meta['key'],UploadId=meta['s3_upload_id'],MultipartUpload={'Parts':meta['parts']})
+        meta_path.unlink(missing_ok=True)
+        stored_path='s3:'+meta['key']; source=video_source(stored_path)
+        dur=video_duration(source)
+        if is_s3_path(match['video_path']) and object_key(match['video_path'])!=meta['key']:
+            s3_client().delete_object(Bucket=os.environ['AWS_S3_BUCKET_NAME'],Key=object_key(match['video_path']))
+        with db() as con:
+            match_owned(con,match_id,user['id'])
+            con.execute("UPDATE matches SET video_path=?,video_name=?,video_duration=?,status='ready' WHERE id=?",(stored_path,meta['filename'],dur,match_id))
+        return {'ok':True,'duration':dur,'name':meta['filename']}
     dest=UPLOADS/f"{match_id}{meta['ext']}"
     old_path=(UPLOADS/Path(match['video_path']).name) if match['video_path'] else None
     part.replace(dest); meta_path.unlink(missing_ok=True)
@@ -292,6 +337,8 @@ def get_video(match_id:str,token:Optional[str]=None,authorization:Optional[str]=
     user=get_user(f"Bearer {token}" if token else authorization)
     with db() as con: m=match_owned(con,match_id,user['id'])
     if not m['video_path']: raise HTTPException(404,'No video uploaded')
+    if is_s3_path(m['video_path']):
+        return RedirectResponse(video_source(m['video_path']),status_code=307)
     p=UPLOADS/m['video_path']
     if not p.exists(): raise HTTPException(404,'Video file missing')
     return FileResponse(p,filename=m['video_name'] or p.name)
@@ -371,9 +418,9 @@ def run_ai_analysis(job_id,match_id):
             config=con.execute("SELECT * FROM match_ai_config WHERE match_id=?",(match_id,)).fetchone()
         if not match or not match['video_path']: raise RuntimeError('No uploaded footage found')
         if not config: raise RuntimeError('Target goalkeeper description is missing')
-        video=UPLOADS/Path(match['video_path']).name
-        if not video.exists(): raise RuntimeError('Uploaded footage file is missing')
-        duration=match['video_duration'] or video_duration(video)
+        source=video_source(match['video_path'])
+        if not is_s3_path(match['video_path']) and not Path(source).exists(): raise RuntimeError('Uploaded footage file is missing')
+        duration=match['video_duration'] or video_duration(source)
         if not duration: raise RuntimeError('Could not determine video duration')
         interval=max(30.0,float(duration)/60.0)
         timestamps=[min(float(duration)-0.1,i*interval+interval/2) for i in range(max(1,int(float(duration)/interval)))]
@@ -383,7 +430,7 @@ def run_ai_analysis(job_id,match_id):
             temp_path=Path(temp); frames=[]
             for i,second in enumerate(timestamps):
                 frame=temp_path/f'frame-{i:03}.jpg'
-                result=subprocess.run(['ffmpeg','-loglevel','error','-ss',str(second),'-i',str(video),'-frames:v','1','-vf','scale=640:-2','-q:v','4','-y',str(frame)],capture_output=True,timeout=45)
+                result=subprocess.run(['ffmpeg','-loglevel','error','-ss',str(second),'-i',source,'-frames:v','1','-vf','scale=640:-2','-q:v','4','-y',str(frame)],capture_output=True,timeout=45)
                 if result.returncode==0 and frame.exists(): frames.append((second,frame))
                 update_analysis_job(job_id,'running',min(35,5+round((i+1)/len(timestamps)*30)),'Sampling footage across the match')
             if not frames: raise RuntimeError('No frames could be extracted from the footage')
