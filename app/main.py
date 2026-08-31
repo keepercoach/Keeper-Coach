@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, Depends, File, Form, Header, HTTPException, UploadFile
+from fastapi import FastAPI, Depends, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -93,6 +93,8 @@ class KeeperIn(BaseModel):
     name:str; dob:Optional[str]=None; club:Optional[str]=None; team:Optional[str]=None; height_cm:Optional[int]=None; dominant_foot:Optional[str]=None
 class MatchIn(BaseModel):
     keeper_id:str; opponent:str; match_date:str; result:Optional[str]=None; minutes:int=90; competition:Optional[str]=None
+class VideoUploadStart(BaseModel):
+    filename:str; size:int
 class EventIn(BaseModel):
     second:float=0; event_type:str; outcome:Optional[str]=None; technique:int=5; decision_making:int=5; positioning:int=5; execution:int=5; note:Optional[str]=None
 
@@ -199,6 +201,55 @@ def video_duration(path:Path):
         p=subprocess.run(['ffprobe','-v','error','-show_entries','format=duration','-of','default=noprint_wrappers=1:nokey=1',str(path)],capture_output=True,text=True,timeout=15)
         return round(float(p.stdout.strip()),2) if p.returncode==0 and p.stdout.strip() else None
     except Exception: return None
+
+def upload_paths(match_id:str,upload_id:str):
+    safe_upload_id=''.join(c for c in upload_id if c.isalnum())
+    if not safe_upload_id or safe_upload_id != upload_id: raise HTTPException(400,'Invalid upload')
+    return UPLOADS/f"{match_id}.{upload_id}.part",UPLOADS/f"{match_id}.{upload_id}.json"
+
+@app.post('/api/matches/{match_id}/video/start')
+def start_video_upload(match_id:str,x:VideoUploadStart,user=Depends(get_user)):
+    allowed={'.mp4','.mov','.m4v','.webm'}; ext=Path(x.filename or '').suffix.lower()
+    if ext not in allowed: raise HTTPException(400,'Upload MP4, MOV, M4V or WebM video')
+    max_bytes=int(os.environ.get('KEEPERCOACH_MAX_UPLOAD_MB','5120'))*1024*1024
+    if x.size<=0 or x.size>max_bytes: raise HTTPException(413,f'Video exceeds the {max_bytes//(1024*1024)} MB upload limit')
+    with db() as con: match_owned(con,match_id,user['id'])
+    upload_id=uid(); part,meta=upload_paths(match_id,upload_id)
+    part.write_bytes(b'')
+    meta.write_text(json.dumps({'filename':x.filename,'size':x.size,'ext':ext}),encoding='utf-8')
+    return {'upload_id':upload_id,'uploaded':0}
+
+@app.post('/api/matches/{match_id}/video/chunk/{upload_id}')
+async def upload_video_chunk(match_id:str,upload_id:str,request:Request,offset:int,user=Depends(get_user)):
+    with db() as con: match_owned(con,match_id,user['id'])
+    part,meta_path=upload_paths(match_id,upload_id)
+    if not part.exists() or not meta_path.exists(): raise HTTPException(404,'Upload session not found')
+    meta=json.loads(meta_path.read_text(encoding='utf-8'))
+    current=part.stat().st_size
+    if offset!=current: raise HTTPException(409,detail={'message':'Upload offset changed','uploaded':current})
+    with part.open('ab') as out:
+        async for chunk in request.stream():
+            if current+len(chunk)>meta['size']:
+                raise HTTPException(413,'Upload exceeds expected file size')
+            out.write(chunk); current+=len(chunk)
+    return {'uploaded':current}
+
+@app.post('/api/matches/{match_id}/video/complete/{upload_id}')
+def complete_video_upload(match_id:str,upload_id:str,user=Depends(get_user)):
+    with db() as con: match=match_owned(con,match_id,user['id'])
+    part,meta_path=upload_paths(match_id,upload_id)
+    if not part.exists() or not meta_path.exists(): raise HTTPException(404,'Upload session not found')
+    meta=json.loads(meta_path.read_text(encoding='utf-8'))
+    if part.stat().st_size!=meta['size']: raise HTTPException(400,'Upload is incomplete')
+    dest=UPLOADS/f"{match_id}{meta['ext']}"
+    old_path=(UPLOADS/Path(match['video_path']).name) if match['video_path'] else None
+    part.replace(dest); meta_path.unlink(missing_ok=True)
+    if old_path and old_path!=dest: old_path.unlink(missing_ok=True)
+    dur=video_duration(dest)
+    with db() as con:
+        match_owned(con,match_id,user['id'])
+        con.execute("UPDATE matches SET video_path=?,video_name=?,video_duration=?,status='ready' WHERE id=?",(dest.name,meta['filename'],dur,match_id))
+    return {'ok':True,'duration':dur,'name':meta['filename']}
 
 @app.post('/api/matches/{match_id}/video')
 async def upload_video(match_id:str,file:UploadFile=File(...),user=Depends(get_user)):
