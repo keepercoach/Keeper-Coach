@@ -174,6 +174,26 @@ def create_match(x:MatchIn,user=Depends(get_user)):
                     (mid,x.keeper_id,x.opponent,x.match_date,x.result,x.minutes,x.competition,'ready',now()))
     return {'id':mid}
 
+@app.delete('/api/matches/{match_id}')
+def delete_match(match_id:str,user=Depends(get_user)):
+    video_file = None
+    with db() as con:
+        match = match_owned(con,match_id,user['id'])
+        if match['video_path']:
+            candidate = (UPLOADS / Path(match['video_path']).name).resolve()
+            if candidate.parent == UPLOADS.resolve():
+                video_file = candidate
+        # Events are removed by the foreign-key cascade in the same transaction.
+        con.execute("DELETE FROM matches WHERE id=?",(match_id,))
+    if video_file:
+        try:
+            video_file.unlink(missing_ok=True)
+        except OSError:
+            # The match is already safely deleted; a storage cleanup failure should
+            # not make the client retry a destructive operation.
+            pass
+    return {'ok':True}
+
 def video_duration(path:Path):
     try:
         p=subprocess.run(['ffprobe','-v','error','-show_entries','format=duration','-of','default=noprint_wrappers=1:nokey=1',str(path)],capture_output=True,text=True,timeout=15)
@@ -287,3 +307,4 @@ def health(): return {'ok':True,'version':'1.1.0','storage':str(DATA)}
 app.mount('/static',StaticFiles(directory=STATIC),name='static')
 @app.get('/')
 def root(): return FileResponse(STATIC/'index.html')
+
