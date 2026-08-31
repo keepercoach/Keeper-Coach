@@ -270,7 +270,8 @@ async def upload_video(match_id:str,file:UploadFile=File(...),user=Depends(get_u
     return {'ok':True,'duration':dur,'name':file.filename}
 
 @app.get('/api/matches/{match_id}/video')
-def get_video(match_id:str,user=Depends(get_user)):
+def get_video(match_id:str,token:Optional[str]=None,authorization:Optional[str]=Header(default=None)):
+    user=get_user(f"Bearer {token}" if token else authorization)
     with db() as con: m=match_owned(con,match_id,user['id'])
     if not m['video_path']: raise HTTPException(404,'No video uploaded')
     p=UPLOADS/m['video_path']
