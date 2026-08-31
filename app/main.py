@@ -1,10 +1,10 @@
 from __future__ import annotations
-import hashlib, hmac, json, os, secrets, sqlite3, subprocess, time, uuid
+import base64, hashlib, hmac, json, os, secrets, sqlite3, subprocess, tempfile, time, urllib.request, uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, Depends, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi import FastAPI, BackgroundTasks, Depends, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -45,6 +45,22 @@ CREATE TABLE IF NOT EXISTS events(
  second REAL NOT NULL DEFAULT 0, event_type TEXT NOT NULL, outcome TEXT,
  technique INTEGER DEFAULT 5, decision_making INTEGER DEFAULT 5, positioning INTEGER DEFAULT 5,
  execution INTEGER DEFAULT 5, note TEXT, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS analysis_jobs(
+ id TEXT PRIMARY KEY, match_id TEXT NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+ status TEXT NOT NULL, progress INTEGER NOT NULL DEFAULT 0, message TEXT,
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS ai_suggestions(
+ id TEXT PRIMARY KEY, match_id TEXT NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+ second REAL NOT NULL, event_type TEXT NOT NULL, outcome TEXT, confidence REAL NOT NULL,
+ technique INTEGER DEFAULT 5, decision_making INTEGER DEFAULT 5,
+ positioning INTEGER DEFAULT 5, execution INTEGER DEFAULT 5,
+ note TEXT, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS match_ai_config(
+ match_id TEXT PRIMARY KEY REFERENCES matches(id) ON DELETE CASCADE,
+ goalkeeper_description TEXT NOT NULL, updated_at TEXT NOT NULL
 );
 """
 
@@ -95,6 +111,8 @@ class MatchIn(BaseModel):
     keeper_id:str; opponent:str; match_date:str; result:Optional[str]=None; minutes:int=90; competition:Optional[str]=None
 class VideoUploadStart(BaseModel):
     filename:str; size:int
+class AIAnalysisStart(BaseModel):
+    goalkeeper_description:str
 class EventIn(BaseModel):
     second:float=0; event_type:str; outcome:Optional[str]=None; technique:int=5; decision_making:int=5; positioning:int=5; execution:int=5; note:Optional[str]=None
 
@@ -300,6 +318,138 @@ def delete_event(event_id:str,user=Depends(get_user)):
         row=con.execute("SELECT e.id FROM events e JOIN matches m ON m.id=e.match_id JOIN keepers k ON k.id=m.keeper_id WHERE e.id=? AND k.owner_user_id=?",(event_id,user['id'])).fetchone()
         if not row: raise HTTPException(404,'Event not found')
         con.execute("DELETE FROM events WHERE id=?",(event_id,))
+    return {'ok':True}
+
+def update_analysis_job(job_id,status,progress,message):
+    with db() as con:
+        con.execute("UPDATE analysis_jobs SET status=?,progress=?,message=?,updated_at=? WHERE id=?",(status,progress,message,now(),job_id))
+
+def openai_frame_batch(frames,goalkeeper_description):
+    api_key=os.environ.get('OPENAI_API_KEY')
+    if not api_key: raise RuntimeError('OpenAI API key is not configured')
+    content=[{'type':'input_text','text':(
+        'You are assisting a qualified goalkeeper coach. Review these chronological match frames. '
+        f'The only target goalkeeper is described as: {goalkeeper_description}. '
+        'Ignore every other player and return no event when the target goalkeeper cannot be identified confidently. '
+        'Only propose a goalkeeper event when it is visibly supported. Do not invent an outcome. '
+        'Return the frame_index, one event_type from Save, 1v1, Cross, Distribution, Sweeper, or Goal conceded, '
+        'a short outcome, confidence from 0 to 1, four provisional 1-10 scores, and a concise evidence-based note. '
+        'Omit uncertain frames. These are suggestions requiring coach review.'
+    )}]
+    for _,path in frames:
+        encoded=base64.b64encode(path.read_bytes()).decode()
+        content.append({'type':'input_image','image_url':f'data:image/jpeg;base64,{encoded}','detail':'low'})
+    schema={'type':'object','properties':{'events':{'type':'array','items':{
+        'type':'object','properties':{
+            'frame_index':{'type':'integer','minimum':0},
+            'event_type':{'type':'string','enum':['Save','1v1','Cross','Distribution','Sweeper','Goal conceded']},
+            'outcome':{'type':'string'},'confidence':{'type':'number','minimum':0,'maximum':1},
+            'technique':{'type':'integer','minimum':1,'maximum':10},
+            'decision_making':{'type':'integer','minimum':1,'maximum':10},
+            'positioning':{'type':'integer','minimum':1,'maximum':10},
+            'execution':{'type':'integer','minimum':1,'maximum':10},
+            'note':{'type':'string'}
+        },'required':['frame_index','event_type','outcome','confidence','technique','decision_making','positioning','execution','note'],
+        'additionalProperties':False}}},'required':['events'],'additionalProperties':False}
+    payload={'model':os.environ.get('OPENAI_VISION_MODEL','gpt-5.6-luna'),'input':[{'role':'user','content':content}],
+             'text':{'format':{'type':'json_schema','name':'goalkeeper_events','strict':True,'schema':schema}}}
+    req=urllib.request.Request('https://api.openai.com/v1/responses',data=json.dumps(payload).encode(),headers={
+        'Authorization':f'Bearer {api_key}','Content-Type':'application/json'})
+    with urllib.request.urlopen(req,timeout=120) as response: result=json.loads(response.read())
+    text=''
+    for item in result.get('output',[]):
+        if item.get('type')=='message':
+            for part in item.get('content',[]):
+                if part.get('type')=='output_text': text+=part.get('text','')
+    return json.loads(text or '{"events":[]}')
+
+def run_ai_analysis(job_id,match_id):
+    try:
+        update_analysis_job(job_id,'running',1,'Preparing match footage')
+        with db() as con:
+            match=con.execute("SELECT * FROM matches WHERE id=?",(match_id,)).fetchone()
+            config=con.execute("SELECT * FROM match_ai_config WHERE match_id=?",(match_id,)).fetchone()
+        if not match or not match['video_path']: raise RuntimeError('No uploaded footage found')
+        if not config: raise RuntimeError('Target goalkeeper description is missing')
+        video=UPLOADS/Path(match['video_path']).name
+        if not video.exists(): raise RuntimeError('Uploaded footage file is missing')
+        duration=match['video_duration'] or video_duration(video)
+        if not duration: raise RuntimeError('Could not determine video duration')
+        interval=max(30.0,float(duration)/60.0)
+        timestamps=[min(float(duration)-0.1,i*interval+interval/2) for i in range(max(1,int(float(duration)/interval)))]
+        timestamps=timestamps[:60]
+        with db() as con: con.execute("DELETE FROM ai_suggestions WHERE match_id=? AND status='pending'",(match_id,))
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path=Path(temp); frames=[]
+            for i,second in enumerate(timestamps):
+                frame=temp_path/f'frame-{i:03}.jpg'
+                result=subprocess.run(['ffmpeg','-loglevel','error','-ss',str(second),'-i',str(video),'-frames:v','1','-vf','scale=640:-2','-q:v','4','-y',str(frame)],capture_output=True,timeout=45)
+                if result.returncode==0 and frame.exists(): frames.append((second,frame))
+                update_analysis_job(job_id,'running',min(35,5+round((i+1)/len(timestamps)*30)),'Sampling footage across the match')
+            if not frames: raise RuntimeError('No frames could be extracted from the footage')
+            batch_size=6
+            for start in range(0,len(frames),batch_size):
+                batch=frames[start:start+batch_size]; proposals=openai_frame_batch(batch,config['goalkeeper_description'])
+                with db() as con:
+                    for proposal in proposals.get('events',[]):
+                        index=proposal.get('frame_index',-1)
+                        confidence=float(proposal.get('confidence',0))
+                        if not 0<=index<len(batch) or confidence<0.65: continue
+                        second=batch[index][0]
+                        score=lambda key:max(1,min(10,int(proposal.get(key,5))))
+                        con.execute("INSERT INTO ai_suggestions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",(
+                            uid(),match_id,second,proposal['event_type'],proposal.get('outcome'),confidence,
+                            score('technique'),score('decision_making'),score('positioning'),score('execution'),
+                            proposal.get('note'),'pending',now()))
+                progress=35+round(min(len(frames),start+len(batch))/len(frames)*60)
+                update_analysis_job(job_id,'running',progress,'Reviewing sampled goalkeeper moments')
+        update_analysis_job(job_id,'complete',100,'AI suggestions are ready for coach review')
+    except Exception as exc:
+        message=str(exc)
+        if 'api key' not in message.lower() and 'uploaded footage' not in message.lower() and 'duration' not in message.lower():
+            message='AI analysis could not be completed. Check the service logs and API configuration.'
+        update_analysis_job(job_id,'failed',0,message)
+
+@app.post('/api/matches/{match_id}/ai-analysis')
+def start_ai_analysis(match_id:str,x:AIAnalysisStart,background_tasks:BackgroundTasks,user=Depends(get_user)):
+    description=x.goalkeeper_description.strip()
+    if len(description)<8: raise HTTPException(400,'Describe the goalkeeper using shirt colour, number or other visible details')
+    with db() as con:
+        match=match_owned(con,match_id,user['id'])
+        if not match['video_path']: raise HTTPException(400,'Upload footage before running AI analysis')
+        con.execute("INSERT INTO match_ai_config(match_id,goalkeeper_description,updated_at) VALUES(?,?,?) ON CONFLICT(match_id) DO UPDATE SET goalkeeper_description=excluded.goalkeeper_description,updated_at=excluded.updated_at",(match_id,description,now()))
+        active=con.execute("SELECT id FROM analysis_jobs WHERE match_id=? AND status IN ('queued','running')",(match_id,)).fetchone()
+        if active: return {'job_id':active['id'],'status':'running'}
+        job_id=uid(); con.execute("INSERT INTO analysis_jobs VALUES(?,?,?,?,?,?,?)",(job_id,match_id,'queued',0,'Queued',now(),now()))
+    background_tasks.add_task(run_ai_analysis,job_id,match_id)
+    return {'job_id':job_id,'status':'queued'}
+
+@app.get('/api/matches/{match_id}/ai-analysis')
+def get_ai_analysis(match_id:str,user=Depends(get_user)):
+    with db() as con:
+        match_owned(con,match_id,user['id'])
+        job=con.execute("SELECT * FROM analysis_jobs WHERE match_id=? ORDER BY created_at DESC LIMIT 1",(match_id,)).fetchone()
+        suggestions=con.execute("SELECT * FROM ai_suggestions WHERE match_id=? ORDER BY second",(match_id,)).fetchall()
+        config=con.execute("SELECT goalkeeper_description FROM match_ai_config WHERE match_id=?",(match_id,)).fetchone()
+    return {'job':dict(job) if job else None,'suggestions':[dict(x) for x in suggestions],
+            'goalkeeper_description':config['goalkeeper_description'] if config else ''}
+
+@app.post('/api/ai-suggestions/{suggestion_id}/accept')
+def accept_ai_suggestion(suggestion_id:str,user=Depends(get_user)):
+    with db() as con:
+        row=con.execute("SELECT s.* FROM ai_suggestions s JOIN matches m ON m.id=s.match_id JOIN keepers k ON k.id=m.keeper_id WHERE s.id=? AND k.owner_user_id=?",(suggestion_id,user['id'])).fetchone()
+        if not row: raise HTTPException(404,'AI suggestion not found')
+        if row['status']!='pending': raise HTTPException(409,'Suggestion already reviewed')
+        event_id=uid(); con.execute("INSERT INTO events VALUES(?,?,?,?,?,?,?,?,?,?,?)",(event_id,row['match_id'],row['second'],row['event_type'],row['outcome'],row['technique'],row['decision_making'],row['positioning'],row['execution'],row['note'],now()))
+        con.execute("UPDATE ai_suggestions SET status='accepted' WHERE id=?",(suggestion_id,))
+    return {'ok':True,'event_id':event_id}
+
+@app.post('/api/ai-suggestions/{suggestion_id}/reject')
+def reject_ai_suggestion(suggestion_id:str,user=Depends(get_user)):
+    with db() as con:
+        row=con.execute("SELECT s.id FROM ai_suggestions s JOIN matches m ON m.id=s.match_id JOIN keepers k ON k.id=m.keeper_id WHERE s.id=? AND k.owner_user_id=?",(suggestion_id,user['id'])).fetchone()
+        if not row: raise HTTPException(404,'AI suggestion not found')
+        con.execute("UPDATE ai_suggestions SET status='rejected' WHERE id=?",(suggestion_id,))
     return {'ok':True}
 
 def report_for(events):
