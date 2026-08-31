@@ -210,7 +210,7 @@ async def upload_video(match_id:str,file:UploadFile=File(...),user=Depends(get_u
     with dest.open('wb') as out:
         while chunk:=await file.read(1024*1024):
             size+=len(chunk)
-            max_upload_mb = int(os.environ.get('KEEPERCOACH_MAX_UPLOAD_MB', '500'))
+            max_upload_mb = int(os.environ.get('KEEPERCOACH_MAX_UPLOAD_MB', '5120'))
             if size > max_upload_mb * 1024 * 1024:
                 out.close(); dest.unlink(missing_ok=True); raise HTTPException(413, f'Video exceeds {max_upload_mb} MB upload limit')
             out.write(chunk)
