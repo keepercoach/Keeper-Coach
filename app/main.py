@@ -375,7 +375,7 @@ def update_analysis_job(job_id,status,progress,message):
 def openai_vision_json(content,schema,name):
     api_key=os.environ.get('OPENAI_API_KEY')
     if not api_key: raise RuntimeError('OpenAI API key is not configured')
-    payload={'model':os.environ.get('OPENAI_VISION_MODEL','gpt-5.6-luna'),'input':[{'role':'user','content':content}],
+    payload={'model':os.environ.get('OPENAI_VISION_MODEL','gpt-5.6-sol'),'input':[{'role':'user','content':content}],
              'text':{'format':{'type':'json_schema','name':name,'strict':True,'schema':schema}}}
     req=urllib.request.Request('https://api.openai.com/v1/responses',data=json.dumps(payload).encode(),headers={
         'Authorization':f'Bearer {api_key}','Content-Type':'application/json'})
@@ -438,12 +438,14 @@ def openai_candidate_batch(frames,goalkeeper_description):
 
 def openai_sequence_batch(sequences,goalkeeper_description):
     content=[{'type':'input_text','text':(
-        'Act as a careful goalkeeper video analyst. Each numbered moment contains five chronological frames '
-        '(before, approach, centre, aftermath, later aftermath). Use the sequence—not a single still—to decide '
+        'Act as a careful goalkeeper video analyst. Each numbered moment contains nine chronological frames, '
+        'one second apart from four seconds before to four seconds after the centre time. Use the full sequence '
+        'to identify the setup, goalkeeper action, and outcome—not a single still. '
         'whether the TARGET goalkeeper performed a real event. Return at most one event per moment. '
         f'TARGET goalkeeper: {goalkeeper_description}. Ignore every other player and the opposite goalkeeper. '
         'Only report Save, 1v1, Cross, Distribution, Sweeper, or Goal conceded. The outcome and note must say '
-        'what is visibly evidenced: action, result, body/starting position, and a concrete coaching observation. '
+        'Provide visible_evidence stating what changes across the frames and a separate coaching_point naming a '
+        'specific technical detail (set shape, footwork, handling, body line, decision timing, recovery, or distribution). '
         'Do not use generic wording such as good effort, solid moment, or could improve. Scores are provisional '
         '1-10 assessments supported by the visible sequence. Omit moments where identity, action, or outcome is unclear.'
     )}]
@@ -456,8 +458,8 @@ def openai_sequence_batch(sequences,goalkeeper_description):
         'outcome':{'type':'string'},'confidence':{'type':'number','minimum':0,'maximum':1},
         'technique':{'type':'integer','minimum':1,'maximum':10},'decision_making':{'type':'integer','minimum':1,'maximum':10},
         'positioning':{'type':'integer','minimum':1,'maximum':10},'execution':{'type':'integer','minimum':1,'maximum':10},
-        'note':{'type':'string'}},
-        'required':['moment_index','event_type','outcome','confidence','technique','decision_making','positioning','execution','note'],
+        'visible_evidence':{'type':'string'},'coaching_point':{'type':'string'}},
+        'required':['moment_index','event_type','outcome','confidence','technique','decision_making','positioning','execution','visible_evidence','coaching_point'],
         'additionalProperties':False}
     schema={'type':'object','properties':{'events':{'type':'array','items':event}},'required':['events'],'additionalProperties':False}
     return openai_vision_json(content,schema,'goalkeeper_events')
@@ -477,9 +479,9 @@ def run_ai_analysis(job_id,match_id):
         if not duration: raise RuntimeError('Could not determine video duration')
         # A sparse 60-frame scan misses most goalkeeper actions. Search up to 450
         # frames first, then spend high-detail vision only on short candidate bursts.
-        interval=max(8.0,float(duration)/450.0)
+        interval=max(6.0,float(duration)/600.0)
         timestamps=[min(float(duration)-0.1,i*interval+interval/2) for i in range(max(1,int(float(duration)/interval)))]
-        timestamps=timestamps[:450]
+        timestamps=timestamps[:600]
         with db() as con: con.execute("DELETE FROM ai_suggestions WHERE match_id=? AND status='pending'",(match_id,))
         with tempfile.TemporaryDirectory() as temp:
             temp_path=Path(temp); frames=[]
@@ -509,26 +511,28 @@ def run_ai_analysis(job_id,match_id):
                 # temporal review completely. Review an even spread as fallback.
                 stride=max(1,len(frames)//60)
                 moments=[second for second,_ in frames[::stride]][:60]
-            moments=moments[:60]
+            moments=moments[:90]
             sequences=[]
             for moment_index,second in enumerate(moments):
                 paths=[]
-                for frame_index,offset in enumerate((-4,-2,0,2,4)):
+                for frame_index,offset in enumerate((-4,-3,-2,-1,0,1,2,3,4)):
                     at=max(0.0,min(float(duration)-0.1,second+offset)); frame=temp_path/f'moment-{moment_index:03}-{frame_index}.jpg'
                     vf=goalkeeper_frame_filter(config['goalkeeper_description'],at,duration,1280)
                     result=subprocess.run(['ffmpeg','-loglevel','error','-ss',str(at),'-i',source,'-frames:v','1','-vf',vf,'-q:v','3','-y',str(frame)],capture_output=True,timeout=45)
                     if result.returncode==0 and frame.exists(): paths.append(frame)
-                if len(paths)==5: sequences.append((second,paths))
+                if len(paths)==9: sequences.append((second,paths))
                 update_analysis_job(job_id,'running',60+round((moment_index+1)/max(1,len(moments))*10),'Building before-and-after action sequences')
-            for start in range(0,len(sequences),3):
-                batch=sequences[start:start+3]; proposals=openai_sequence_batch(batch,config['goalkeeper_description'])
+            for start in range(0,len(sequences),2):
+                batch=sequences[start:start+2]; proposals=openai_sequence_batch(batch,config['goalkeeper_description'])
                 with db() as con:
                     for proposal in proposals.get('events',[]):
                         index=proposal.get('moment_index',-1); confidence=float(proposal.get('confidence',0))
-                        note=str(proposal.get('note') or '').strip()
+                        evidence=str(proposal.get('visible_evidence') or '').strip()
+                        coaching=str(proposal.get('coaching_point') or '').strip()
+                        note=f'{evidence} Coaching: {coaching}'
                         outcome=str(proposal.get('outcome') or '').strip()
                         vague=('good effort','solid moment','could improve','nice action')
-                        if (not 0<=index<len(batch) or confidence<0.52 or len(note)<20 or
+                        if (not 0<=index<len(batch) or confidence<0.48 or len(evidence)<25 or len(coaching)<20 or
                                 len(outcome)<3 or any(term in note.lower() for term in vague)): continue
                         second=batch[index][0]
                         score=lambda key:max(1,min(10,int(proposal.get(key,5))))
