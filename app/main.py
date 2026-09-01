@@ -550,9 +550,17 @@ def gemini_video_analysis(match,goalkeeper_description,job_id):
             'moment, or could improve. Scores must be integers from 1 to 10.'
         )
         update_analysis_job(job_id,'running',55,'Watching the complete match and locating goalkeeper actions')
-        response=requests.post('https://generativelanguage.googleapis.com/v1beta/interactions',headers={
-            'x-goog-api-key':api_key,'Content-Type':'application/json'},json={'model':os.environ.get('GEMINI_VIDEO_MODEL','gemini-3.7-flash'),
-            'input':[{'type':'video','uri':uri,'mime_type':mime},{'type':'text','text':prompt}]},timeout=900)
+        response=None
+        for attempt in range(1,5):
+            response=requests.post('https://generativelanguage.googleapis.com/v1beta/interactions',headers={
+                'x-goog-api-key':api_key,'Content-Type':'application/json'},json={'model':os.environ.get('GEMINI_VIDEO_MODEL','gemini-3.7-flash'),
+                'input':[{'type':'video','uri':uri,'mime_type':mime},{'type':'text','text':prompt}]},timeout=900)
+            if response.status_code not in (429,500,502,503,504): break
+            if attempt==4: break
+            wait_seconds=attempt*30
+            update_analysis_job(job_id,'running',55,
+                f'Video analysis service is busy — retrying automatically ({attempt}/3)')
+            time.sleep(wait_seconds)
         response.raise_for_status(); payload=response.json()
         texts=[]
         def collect(value):
