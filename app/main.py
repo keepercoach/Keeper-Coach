@@ -1,6 +1,6 @@
 from __future__ import annotations
 import base64, hashlib, hmac, json, logging, os, secrets, shutil, sqlite3, subprocess, tempfile, time, urllib.error, urllib.request, uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -120,6 +120,16 @@ def init_db():
                 con.execute("INSERT INTO events VALUES(?,?,?,?,?,?,?,?,?,?,?)",(uid(),match_id,sec,typ,out,t,d,p,e,n,now()))
 
 init_db()
+
+def expire_interrupted_analysis_jobs():
+    """Background tasks do not survive a deployment or container restart."""
+    with db() as con:
+        con.execute(
+            "UPDATE analysis_jobs SET status='failed',progress=0,message=?,updated_at=? "
+            "WHERE status IN ('queued','running')",
+            ('The scan was interrupted by an app restart. Please start it again.',now()))
+
+expire_interrupted_analysis_jobs()
 
 class Register(BaseModel):
     email:str; password:str; name:str; role:str='keeper'
@@ -692,6 +702,11 @@ def start_ai_analysis(match_id:str,x:AIAnalysisStart,background_tasks:Background
         match=match_owned(con,match_id,user['id'])
         if not match['video_path']: raise HTTPException(400,'Upload footage before running AI analysis')
         con.execute("INSERT INTO match_ai_config(match_id,goalkeeper_description,updated_at) VALUES(?,?,?) ON CONFLICT(match_id) DO UPDATE SET goalkeeper_description=excluded.goalkeeper_description,updated_at=excluded.updated_at",(match_id,description,now()))
+        stale_before=(datetime.now(timezone.utc)-timedelta(minutes=30)).isoformat()
+        con.execute(
+            "UPDATE analysis_jobs SET status='failed',progress=0,message=?,updated_at=? "
+            "WHERE match_id=? AND status IN ('queued','running') AND updated_at<?",
+            ('The scan stopped unexpectedly. Please start it again.',now(),match_id,stale_before))
         active=con.execute("SELECT id FROM analysis_jobs WHERE match_id=? AND status IN ('queued','running')",(match_id,)).fetchone()
         if active: return {'job_id':active['id'],'status':'running'}
         job_id=uid(); con.execute("INSERT INTO analysis_jobs VALUES(?,?,?,?,?,?,?)",(job_id,match_id,'queued',0,'Queued',now(),now()))
