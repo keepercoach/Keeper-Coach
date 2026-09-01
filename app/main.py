@@ -542,7 +542,7 @@ def gemini_video_analysis(match,goalkeeper_description,job_id):
         update_analysis_job(job_id,'running',55,'Watching the complete match and locating goalkeeper actions')
         response=requests.post('https://generativelanguage.googleapis.com/v1beta/interactions',headers={
             'x-goog-api-key':api_key,'Content-Type':'application/json'},json={'model':os.environ.get('GEMINI_VIDEO_MODEL','gemini-3.7-flash'),
-            'input':[{'type':'video','uri':uri,'mime_type':mime,'media_resolution':'low'},{'type':'text','text':prompt}]},timeout=900)
+            'input':[{'type':'video','uri':uri,'mime_type':mime},{'type':'text','text':prompt}]},timeout=900)
         response.raise_for_status(); payload=response.json()
         texts=[]
         def collect(value):
