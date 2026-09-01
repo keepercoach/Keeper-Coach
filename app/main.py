@@ -545,8 +545,9 @@ def gemini_video_analysis(match,goalkeeper_description,job_id):
             '"event_type":"Save|1v1|Cross|Distribution|Sweeper|Goal conceded","outcome":"specific visible result",'
             '"confidence":0.0,"technique":1,"decision_making":1,"positioning":1,"execution":1,'
             '"visible_evidence":"what happens before, during and after the action",'
-            '"coaching_point":"one concrete technical observation"}]}. Include all genuine involvements, but omit routine '
-            'standing and anything where identity or outcome is unclear. Never use vague phrases such as good effort, solid '
+            '"coaching_point":"one concrete technical observation"}]}. Include definite and possible goalkeeper involvements '
+            'with confidence of 0.30 or higher so a human coach can review borderline moments. Omit routine standing and '
+            'moments where the target goalkeeper cannot be identified at all. Never use vague phrases such as good effort, solid '
             'moment, or could improve. Scores must be integers from 1 to 10.'
         )
         update_analysis_job(job_id,'running',55,'Watching the complete match and locating goalkeeper actions')
@@ -608,7 +609,9 @@ def run_ai_analysis(job_id,match_id):
                     event_type=proposal.get('event_type')
                     evidence=str(proposal.get('visible_evidence') or '').strip()
                     coaching=str(proposal.get('coaching_point') or '').strip()
-                    if second<0 or second>float(duration) or confidence<0.45 or event_type not in ('Save','1v1','Cross','Distribution','Sweeper','Goal conceded'): continue
+                    # Keep lower-confidence possibilities in the coach-review queue.
+                    # Nothing becomes a report event until a coach explicitly accepts it.
+                    if second<0 or second>float(duration) or confidence<0.30 or event_type not in ('Save','1v1','Cross','Distribution','Sweeper','Goal conceded'): continue
                     score=lambda key:max(1,min(10,int(proposal.get(key,5))))
                     con.execute("INSERT INTO ai_suggestions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",(
                         uid(),match_id,second,event_type,str(proposal.get('outcome') or '').strip(),confidence,
