@@ -372,35 +372,11 @@ def update_analysis_job(job_id,status,progress,message):
     with db() as con:
         con.execute("UPDATE analysis_jobs SET status=?,progress=?,message=?,updated_at=? WHERE id=?",(status,progress,message,now(),job_id))
 
-def openai_frame_batch(frames,goalkeeper_description):
+def openai_vision_json(content,schema,name):
     api_key=os.environ.get('OPENAI_API_KEY')
     if not api_key: raise RuntimeError('OpenAI API key is not configured')
-    content=[{'type':'input_text','text':(
-        'You are assisting a qualified goalkeeper coach. Review these chronological match frames. '
-        f'The only target goalkeeper is described as: {goalkeeper_description}. '
-        'Ignore every other player and return no event when the target goalkeeper cannot be identified confidently. '
-        'Only propose a goalkeeper event when it is visibly supported. Do not invent an outcome. '
-        'Return the frame_index, one event_type from Save, 1v1, Cross, Distribution, Sweeper, or Goal conceded, '
-        'a short outcome, confidence from 0 to 1, four provisional 1-10 scores, and a concise evidence-based note. '
-        'Omit uncertain frames. These are suggestions requiring coach review.'
-    )}]
-    for _,path in frames:
-        encoded=base64.b64encode(path.read_bytes()).decode()
-        content.append({'type':'input_image','image_url':f'data:image/jpeg;base64,{encoded}','detail':'low'})
-    schema={'type':'object','properties':{'events':{'type':'array','items':{
-        'type':'object','properties':{
-            'frame_index':{'type':'integer','minimum':0},
-            'event_type':{'type':'string','enum':['Save','1v1','Cross','Distribution','Sweeper','Goal conceded']},
-            'outcome':{'type':'string'},'confidence':{'type':'number','minimum':0,'maximum':1},
-            'technique':{'type':'integer','minimum':1,'maximum':10},
-            'decision_making':{'type':'integer','minimum':1,'maximum':10},
-            'positioning':{'type':'integer','minimum':1,'maximum':10},
-            'execution':{'type':'integer','minimum':1,'maximum':10},
-            'note':{'type':'string'}
-        },'required':['frame_index','event_type','outcome','confidence','technique','decision_making','positioning','execution','note'],
-        'additionalProperties':False}}},'required':['events'],'additionalProperties':False}
     payload={'model':os.environ.get('OPENAI_VISION_MODEL','gpt-5.6-luna'),'input':[{'role':'user','content':content}],
-             'text':{'format':{'type':'json_schema','name':'goalkeeper_events','strict':True,'schema':schema}}}
+             'text':{'format':{'type':'json_schema','name':name,'strict':True,'schema':schema}}}
     req=urllib.request.Request('https://api.openai.com/v1/responses',data=json.dumps(payload).encode(),headers={
         'Authorization':f'Bearer {api_key}','Content-Type':'application/json'})
     try:
@@ -424,8 +400,71 @@ def openai_frame_batch(frames,goalkeeper_description):
                 if part.get('type')=='output_text': text+=part.get('text','')
     return json.loads(text or '{"events":[]}')
 
+def image_part(path,detail='low'):
+    encoded=base64.b64encode(path.read_bytes()).decode()
+    return {'type':'input_image','image_url':f'data:image/jpeg;base64,{encoded}','detail':detail}
+
+def goalkeeper_frame_filter(description,second,duration,width):
+    """Enlarge the described goal side while retaining enough pitch for action context."""
+    words=description.lower()
+    first_right='first half' in words and 'right' in words.split('second half')[0]
+    second_text=words.split('second half',1)[1] if 'second half' in words else ''
+    second_left='left' in second_text
+    first_left='first half' in words and 'left' in words.split('second half')[0]
+    second_right='right' in second_text
+    side=('right' if first_right else 'left' if first_left else None) if second<float(duration)/2 else ('left' if second_left else 'right' if second_right else None)
+    if side=='right': return f'crop=iw*0.70:ih:iw*0.30:0,scale={width}:-2'
+    if side=='left': return f'crop=iw*0.70:ih:0:0,scale={width}:-2'
+    return f'scale={width}:-2'
+
+def openai_candidate_batch(frames,goalkeeper_description):
+    content=[{'type':'input_text','text':(
+        'This is a coarse search through a football match. Find frames that may show the TARGET goalkeeper '
+        'or play occurring in the target goalkeeper’s defensive third. Include the frame whenever the target is '
+        'visible, the ball is near their penalty area, they have the ball, or an attack is developing toward them. '
+        'Possible later actions include shot/save, 1v1, cross claim/punch, distribution, sweeper action, or goal conceded. '
+        'This is only a discovery pass, so strongly favour recall and let the later temporal review reject routine play. '
+        f'TARGET goalkeeper: {goalkeeper_description}. Each image is preceded by its exact frame_index and time. '
+        'Do not confuse the target with the other goalkeeper or outfield players. Return every plausible candidate.'
+    )}]
+    for index,(second,path) in enumerate(frames):
+        content.append({'type':'input_text','text':f'frame_index={index}, match_time={second:.1f}s'})
+        content.append(image_part(path,'high'))
+    schema={'type':'object','properties':{'candidates':{'type':'array','items':{'type':'object','properties':{
+        'frame_index':{'type':'integer','minimum':0},'confidence':{'type':'number','minimum':0,'maximum':1},
+        'reason':{'type':'string'}},'required':['frame_index','confidence','reason'],'additionalProperties':False}}},
+        'required':['candidates'],'additionalProperties':False}
+    return openai_vision_json(content,schema,'goalkeeper_candidates')
+
+def openai_sequence_batch(sequences,goalkeeper_description):
+    content=[{'type':'input_text','text':(
+        'Act as a careful goalkeeper video analyst. Each numbered moment contains five chronological frames '
+        '(before, approach, centre, aftermath, later aftermath). Use the sequence—not a single still—to decide '
+        'whether the TARGET goalkeeper performed a real event. Return at most one event per moment. '
+        f'TARGET goalkeeper: {goalkeeper_description}. Ignore every other player and the opposite goalkeeper. '
+        'Only report Save, 1v1, Cross, Distribution, Sweeper, or Goal conceded. The outcome and note must say '
+        'what is visibly evidenced: action, result, body/starting position, and a concrete coaching observation. '
+        'Do not use generic wording such as good effort, solid moment, or could improve. Scores are provisional '
+        '1-10 assessments supported by the visible sequence. Omit moments where identity, action, or outcome is unclear.'
+    )}]
+    for moment_index,(second,paths) in enumerate(sequences):
+        content.append({'type':'input_text','text':f'moment_index={moment_index}, centre_time={second:.1f}s; frames begin now in chronological order'})
+        for path in paths: content.append(image_part(path,'high'))
+    event={'type':'object','properties':{
+        'moment_index':{'type':'integer','minimum':0},
+        'event_type':{'type':'string','enum':['Save','1v1','Cross','Distribution','Sweeper','Goal conceded']},
+        'outcome':{'type':'string'},'confidence':{'type':'number','minimum':0,'maximum':1},
+        'technique':{'type':'integer','minimum':1,'maximum':10},'decision_making':{'type':'integer','minimum':1,'maximum':10},
+        'positioning':{'type':'integer','minimum':1,'maximum':10},'execution':{'type':'integer','minimum':1,'maximum':10},
+        'note':{'type':'string'}},
+        'required':['moment_index','event_type','outcome','confidence','technique','decision_making','positioning','execution','note'],
+        'additionalProperties':False}
+    schema={'type':'object','properties':{'events':{'type':'array','items':event}},'required':['events'],'additionalProperties':False}
+    return openai_vision_json(content,schema,'goalkeeper_events')
+
 def run_ai_analysis(job_id,match_id):
     try:
+        suggestion_count=0
         update_analysis_job(job_id,'running',1,'Preparing match footage')
         with db() as con:
             match=con.execute("SELECT * FROM matches WHERE id=?",(match_id,)).fetchone()
@@ -436,35 +475,76 @@ def run_ai_analysis(job_id,match_id):
         if not is_s3_path(match['video_path']) and not Path(source).exists(): raise RuntimeError('Uploaded footage file is missing')
         duration=match['video_duration'] or video_duration(source)
         if not duration: raise RuntimeError('Could not determine video duration')
-        interval=max(30.0,float(duration)/60.0)
+        # A sparse 60-frame scan misses most goalkeeper actions. Search up to 450
+        # frames first, then spend high-detail vision only on short candidate bursts.
+        interval=max(8.0,float(duration)/450.0)
         timestamps=[min(float(duration)-0.1,i*interval+interval/2) for i in range(max(1,int(float(duration)/interval)))]
-        timestamps=timestamps[:60]
+        timestamps=timestamps[:450]
         with db() as con: con.execute("DELETE FROM ai_suggestions WHERE match_id=? AND status='pending'",(match_id,))
         with tempfile.TemporaryDirectory() as temp:
             temp_path=Path(temp); frames=[]
             for i,second in enumerate(timestamps):
                 frame=temp_path/f'frame-{i:03}.jpg'
-                result=subprocess.run(['ffmpeg','-loglevel','error','-ss',str(second),'-i',source,'-frames:v','1','-vf','scale=640:-2','-q:v','4','-y',str(frame)],capture_output=True,timeout=45)
+                vf=goalkeeper_frame_filter(config['goalkeeper_description'],second,duration,1280)
+                result=subprocess.run(['ffmpeg','-loglevel','error','-ss',str(second),'-i',source,'-frames:v','1','-vf',vf,'-q:v','3','-y',str(frame)],capture_output=True,timeout=45)
                 if result.returncode==0 and frame.exists(): frames.append((second,frame))
-                update_analysis_job(job_id,'running',min(35,5+round((i+1)/len(timestamps)*30)),'Sampling footage across the match')
+                update_analysis_job(job_id,'running',min(25,3+round((i+1)/len(timestamps)*22)),'Sampling the full match at close intervals')
             if not frames: raise RuntimeError('No frames could be extracted from the footage')
-            batch_size=6
+            candidates=[]; batch_size=8
             for start in range(0,len(frames),batch_size):
-                batch=frames[start:start+batch_size]; proposals=openai_frame_batch(batch,config['goalkeeper_description'])
+                batch=frames[start:start+batch_size]; found=openai_candidate_batch(batch,config['goalkeeper_description'])
+                for candidate in found.get('candidates',[]):
+                    index=candidate.get('frame_index',-1)
+                    if 0<=index<len(batch) and float(candidate.get('confidence',0))>=0.2:
+                        candidates.append(batch[index][0])
+                progress=25+round(min(len(frames),start+len(batch))/len(frames)*35)
+                update_analysis_job(job_id,'running',progress,'Finding likely goalkeeper involvement')
+            # Merge neighbouring hits into one moment so the same action is not returned repeatedly.
+            moments=[]
+            for second in sorted(candidates):
+                if not moments or second-moments[-1]>16: moments.append(second)
+                else: moments[-1]=(moments[-1]+second)/2
+            if not moments:
+                # Never let an over-cautious discovery response suppress the
+                # temporal review completely. Review an even spread as fallback.
+                stride=max(1,len(frames)//60)
+                moments=[second for second,_ in frames[::stride]][:60]
+            moments=moments[:60]
+            sequences=[]
+            for moment_index,second in enumerate(moments):
+                paths=[]
+                for frame_index,offset in enumerate((-4,-2,0,2,4)):
+                    at=max(0.0,min(float(duration)-0.1,second+offset)); frame=temp_path/f'moment-{moment_index:03}-{frame_index}.jpg'
+                    vf=goalkeeper_frame_filter(config['goalkeeper_description'],at,duration,1280)
+                    result=subprocess.run(['ffmpeg','-loglevel','error','-ss',str(at),'-i',source,'-frames:v','1','-vf',vf,'-q:v','3','-y',str(frame)],capture_output=True,timeout=45)
+                    if result.returncode==0 and frame.exists(): paths.append(frame)
+                if len(paths)==5: sequences.append((second,paths))
+                update_analysis_job(job_id,'running',60+round((moment_index+1)/max(1,len(moments))*10),'Building before-and-after action sequences')
+            for start in range(0,len(sequences),3):
+                batch=sequences[start:start+3]; proposals=openai_sequence_batch(batch,config['goalkeeper_description'])
                 with db() as con:
                     for proposal in proposals.get('events',[]):
-                        index=proposal.get('frame_index',-1)
-                        confidence=float(proposal.get('confidence',0))
-                        if not 0<=index<len(batch) or confidence<0.65: continue
+                        index=proposal.get('moment_index',-1); confidence=float(proposal.get('confidence',0))
+                        note=str(proposal.get('note') or '').strip()
+                        outcome=str(proposal.get('outcome') or '').strip()
+                        vague=('good effort','solid moment','could improve','nice action')
+                        if (not 0<=index<len(batch) or confidence<0.52 or len(note)<20 or
+                                len(outcome)<3 or any(term in note.lower() for term in vague)): continue
                         second=batch[index][0]
                         score=lambda key:max(1,min(10,int(proposal.get(key,5))))
                         con.execute("INSERT INTO ai_suggestions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",(
-                            uid(),match_id,second,proposal['event_type'],proposal.get('outcome'),confidence,
+                            uid(),match_id,second,proposal['event_type'],outcome,confidence,
                             score('technique'),score('decision_making'),score('positioning'),score('execution'),
-                            proposal.get('note'),'pending',now()))
-                progress=35+round(min(len(frames),start+len(batch))/len(frames)*60)
-                update_analysis_job(job_id,'running',progress,'Reviewing sampled goalkeeper moments')
-        update_analysis_job(job_id,'complete',100,'AI suggestions are ready for coach review')
+                            note,'pending',now()))
+                        suggestion_count+=1
+                progress=70+round(min(len(sequences),start+len(batch))/max(1,len(sequences))*25)
+                update_analysis_job(job_id,'running',progress,'Reviewing actions across before-and-after frames')
+        if suggestion_count:
+            noun='suggestion' if suggestion_count==1 else 'suggestions'
+            message=f'{suggestion_count} AI {noun} ready for coach review'
+        else:
+            message='Scan complete — no confident goalkeeper events found'
+        update_analysis_job(job_id,'complete',100,message)
     except Exception as exc:
         message=str(exc)
         logger.exception('AI analysis failed job_id=%s match_id=%s',job_id,match_id)
