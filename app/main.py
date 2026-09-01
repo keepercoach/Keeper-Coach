@@ -1,5 +1,5 @@
 from __future__ import annotations
-import base64, hashlib, hmac, json, logging, os, secrets, sqlite3, subprocess, tempfile, time, urllib.error, urllib.request, uuid
+import base64, hashlib, hmac, json, logging, os, secrets, shutil, sqlite3, subprocess, tempfile, time, urllib.error, urllib.request, uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -480,13 +480,29 @@ def parse_match_time(value):
 def gemini_video_analysis(match,goalkeeper_description,job_id):
     api_key=os.environ.get('GEMINI_API_KEY')
     if not api_key: raise RuntimeError('Gemini API key is not configured')
-    mime=video_mime(match['video_name']); uploaded_name=None
+    mime=video_mime(match['video_name']); uploaded_name=None; analysis_temp=None
     if is_s3_path(match['video_path']):
         obj=s3_client().get_object(Bucket=os.environ['AWS_S3_BUCKET_NAME'],Key=object_key(match['video_path']))
         stream=obj['Body']; size=int(obj['ContentLength'])
     else:
         path=UPLOADS/Path(match['video_path']).name; stream=path.open('rb'); size=path.stat().st_size
     try:
+        # Gemini currently rejects media above 2 GiB. Create a compact analysis
+        # proxy while preserving the original match footage in object storage.
+        if size>=1_900_000_000:
+            try: stream.close()
+            except Exception: pass
+            analysis_temp=Path(tempfile.mkdtemp(prefix='keepercoach-gemini-'))
+            proxy=analysis_temp/'analysis-proxy.mp4'; source=video_source(match['video_path'])
+            update_analysis_job(job_id,'running',3,'Preparing a smaller video copy for analysis')
+            result=subprocess.run(['ffmpeg','-loglevel','error','-i',source,'-vf','scale=1280:-2',
+                '-c:v','libx264','-preset','veryfast','-b:v','1100k','-maxrate','1400k','-bufsize','2800k',
+                '-c:a','aac','-b:a','64k','-movflags','+faststart','-y',str(proxy)],capture_output=True,timeout=10800)
+            if result.returncode!=0 or not proxy.exists():
+                detail=result.stderr.decode('utf-8','replace')[-500:]
+                raise RuntimeError(f'Could not prepare the Gemini analysis copy: {detail}')
+            stream=proxy.open('rb'); size=proxy.stat().st_size; mime='video/mp4'
+            if size>=2_000_000_000: raise RuntimeError('The compressed analysis copy is still larger than Gemini permits')
         start=requests.post('https://generativelanguage.googleapis.com/upload/v1beta/files',headers={
             'x-goog-api-key':api_key,'X-Goog-Upload-Protocol':'resumable','X-Goog-Upload-Command':'start',
             'X-Goog-Upload-Header-Content-Length':str(size),'X-Goog-Upload-Header-Content-Type':mime,
@@ -526,7 +542,7 @@ def gemini_video_analysis(match,goalkeeper_description,job_id):
         update_analysis_job(job_id,'running',55,'Watching the complete match and locating goalkeeper actions')
         response=requests.post('https://generativelanguage.googleapis.com/v1beta/interactions',headers={
             'x-goog-api-key':api_key,'Content-Type':'application/json'},json={'model':os.environ.get('GEMINI_VIDEO_MODEL','gemini-3.7-flash'),
-            'input':[{'type':'video','uri':uri,'mime_type':mime},{'type':'text','text':prompt}]},timeout=900)
+            'input':[{'type':'video','uri':uri,'mime_type':mime,'media_resolution':'low'},{'type':'text','text':prompt}]},timeout=900)
         response.raise_for_status(); payload=response.json()
         texts=[]
         def collect(value):
@@ -546,6 +562,7 @@ def gemini_video_analysis(match,goalkeeper_description,job_id):
     finally:
         try: stream.close()
         except Exception: pass
+        if analysis_temp: shutil.rmtree(analysis_temp,ignore_errors=True)
         if uploaded_name:
             try: requests.delete(f'https://generativelanguage.googleapis.com/v1beta/{uploaded_name}',headers={'x-goog-api-key':api_key},timeout=30)
             except Exception: pass
