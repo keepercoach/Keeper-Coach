@@ -7,6 +7,7 @@ from typing import Optional
 from fastapi import FastAPI, BackgroundTasks, Depends, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, RedirectResponse
 import boto3
+import requests
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -464,6 +465,91 @@ def openai_sequence_batch(sequences,goalkeeper_description):
     schema={'type':'object','properties':{'events':{'type':'array','items':event}},'required':['events'],'additionalProperties':False}
     return openai_vision_json(content,schema,'goalkeeper_events')
 
+def video_mime(filename):
+    return {'.mov':'video/mov','.webm':'video/webm','.avi':'video/avi','.mpeg':'video/mpeg','.mpg':'video/mpeg'}.get(Path(filename or '').suffix.lower(),'video/mp4')
+
+def parse_match_time(value):
+    if isinstance(value,(int,float)): return float(value)
+    parts=str(value or '').strip().split(':')
+    try:
+        total=0.0
+        for part in parts: total=total*60+float(part)
+        return total
+    except (TypeError,ValueError): return -1
+
+def gemini_video_analysis(match,goalkeeper_description,job_id):
+    api_key=os.environ.get('GEMINI_API_KEY')
+    if not api_key: raise RuntimeError('Gemini API key is not configured')
+    mime=video_mime(match['video_name']); uploaded_name=None
+    if is_s3_path(match['video_path']):
+        obj=s3_client().get_object(Bucket=os.environ['AWS_S3_BUCKET_NAME'],Key=object_key(match['video_path']))
+        stream=obj['Body']; size=int(obj['ContentLength'])
+    else:
+        path=UPLOADS/Path(match['video_path']).name; stream=path.open('rb'); size=path.stat().st_size
+    try:
+        start=requests.post('https://generativelanguage.googleapis.com/upload/v1beta/files',headers={
+            'x-goog-api-key':api_key,'X-Goog-Upload-Protocol':'resumable','X-Goog-Upload-Command':'start',
+            'X-Goog-Upload-Header-Content-Length':str(size),'X-Goog-Upload-Header-Content-Type':mime,
+            'Content-Type':'application/json'},json={'file':{'display_name':match['video_name'] or 'Keeper Coach match'}},timeout=60)
+        start.raise_for_status(); upload_url=start.headers.get('X-Goog-Upload-URL') or start.headers.get('x-goog-upload-url')
+        if not upload_url: raise RuntimeError('Gemini did not create a video upload session')
+        offset=0; result=None; chunk_size=8*1024*1024
+        while offset<size:
+            chunk=stream.read(min(chunk_size,size-offset))
+            if not chunk: raise RuntimeError('The stored match video ended before upload completed')
+            final=offset+len(chunk)>=size
+            result=requests.post(upload_url,data=chunk,headers={'Content-Length':str(len(chunk)),
+                'X-Goog-Upload-Offset':str(offset),'X-Goog-Upload-Command':'upload, finalize' if final else 'upload'},timeout=180)
+            result.raise_for_status(); offset+=len(chunk)
+            update_analysis_job(job_id,'running',min(40,5+round(offset/size*35)),'Sending the match to the video analysis engine')
+        info=result.json().get('file',{}); uploaded_name=info.get('name'); uri=info.get('uri')
+        if not uploaded_name or not uri: raise RuntimeError('Gemini video upload did not return a usable file')
+        for _ in range(180):
+            status=requests.get(f'https://generativelanguage.googleapis.com/v1beta/{uploaded_name}',headers={'x-goog-api-key':api_key},timeout=30)
+            status.raise_for_status(); file_info=status.json(); state=file_info.get('state')
+            if state=='ACTIVE': break
+            if state=='FAILED': raise RuntimeError('Gemini could not process the uploaded match video')
+            update_analysis_job(job_id,'running',45,'Preparing the full video for analysis'); time.sleep(5)
+        else: raise RuntimeError('Gemini video processing timed out')
+        prompt=(
+            'Analyse this complete football match as a qualified goalkeeper coach. The only TARGET goalkeeper is: '
+            f'{goalkeeper_description}. Track only that goalkeeper and ignore the opposite goalkeeper. Find every clearly '
+            'visible Save, 1v1, Cross, Distribution, Sweeper action, and Goal conceded. Use the video sequence and audio, '
+            'not isolated frames. Return ONLY valid JSON with this shape: {"events":[{"timestamp":"MM:SS",'
+            '"event_type":"Save|1v1|Cross|Distribution|Sweeper|Goal conceded","outcome":"specific visible result",'
+            '"confidence":0.0,"technique":1,"decision_making":1,"positioning":1,"execution":1,'
+            '"visible_evidence":"what happens before, during and after the action",'
+            '"coaching_point":"one concrete technical observation"}]}. Include all genuine involvements, but omit routine '
+            'standing and anything where identity or outcome is unclear. Never use vague phrases such as good effort, solid '
+            'moment, or could improve. Scores must be integers from 1 to 10.'
+        )
+        update_analysis_job(job_id,'running',55,'Watching the complete match and locating goalkeeper actions')
+        response=requests.post('https://generativelanguage.googleapis.com/v1beta/interactions',headers={
+            'x-goog-api-key':api_key,'Content-Type':'application/json'},json={'model':os.environ.get('GEMINI_VIDEO_MODEL','gemini-3.7-flash'),
+            'input':[{'type':'video','uri':uri,'mime_type':mime},{'type':'text','text':prompt}]},timeout=900)
+        response.raise_for_status(); payload=response.json()
+        texts=[]
+        def collect(value):
+            if isinstance(value,dict):
+                for key,item in value.items():
+                    if key=='text' and isinstance(item,str): texts.append(item)
+                    else: collect(item)
+            elif isinstance(value,list):
+                for item in value: collect(item)
+        collect(payload); raw='\n'.join(texts); begin=raw.find('{'); end=raw.rfind('}')
+        if begin<0 or end<=begin: raise RuntimeError('Gemini returned no structured goalkeeper analysis')
+        return json.loads(raw[begin:end+1])
+    except requests.HTTPError as exc:
+        try: detail=exc.response.json().get('error',{}).get('message')
+        except Exception: detail=None
+        raise RuntimeError(f'Gemini API error {exc.response.status_code}: {detail or "request failed"}') from exc
+    finally:
+        try: stream.close()
+        except Exception: pass
+        if uploaded_name:
+            try: requests.delete(f'https://generativelanguage.googleapis.com/v1beta/{uploaded_name}',headers={'x-goog-api-key':api_key},timeout=30)
+            except Exception: pass
+
 def run_ai_analysis(job_id,match_id):
     try:
         suggestion_count=0
@@ -477,12 +563,32 @@ def run_ai_analysis(job_id,match_id):
         if not is_s3_path(match['video_path']) and not Path(source).exists(): raise RuntimeError('Uploaded footage file is missing')
         duration=match['video_duration'] or video_duration(source)
         if not duration: raise RuntimeError('Could not determine video duration')
+        with db() as con: con.execute("DELETE FROM ai_suggestions WHERE match_id=? AND status='pending'",(match_id,))
+        if os.environ.get('AI_ANALYSIS_PROVIDER','gemini').lower()=='gemini':
+            proposals=gemini_video_analysis(match,config['goalkeeper_description'],job_id)
+            with db() as con:
+                for proposal in proposals.get('events',[]):
+                    second=parse_match_time(proposal.get('timestamp'))
+                    confidence=float(proposal.get('confidence',0))
+                    event_type=proposal.get('event_type')
+                    evidence=str(proposal.get('visible_evidence') or '').strip()
+                    coaching=str(proposal.get('coaching_point') or '').strip()
+                    if second<0 or second>float(duration) or confidence<0.45 or event_type not in ('Save','1v1','Cross','Distribution','Sweeper','Goal conceded'): continue
+                    score=lambda key:max(1,min(10,int(proposal.get(key,5))))
+                    con.execute("INSERT INTO ai_suggestions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",(
+                        uid(),match_id,second,event_type,str(proposal.get('outcome') or '').strip(),confidence,
+                        score('technique'),score('decision_making'),score('positioning'),score('execution'),
+                        f'{evidence} Coaching: {coaching}','pending',now()))
+                    suggestion_count+=1
+            message=(f'{suggestion_count} video-based AI suggestions ready for coach review' if suggestion_count else
+                     'Video scan complete — no confident goalkeeper events found')
+            update_analysis_job(job_id,'complete',100,message)
+            return
         # A sparse 60-frame scan misses most goalkeeper actions. Search up to 450
         # frames first, then spend high-detail vision only on short candidate bursts.
         interval=max(6.0,float(duration)/600.0)
         timestamps=[min(float(duration)-0.1,i*interval+interval/2) for i in range(max(1,int(float(duration)/interval)))]
         timestamps=timestamps[:600]
-        with db() as con: con.execute("DELETE FROM ai_suggestions WHERE match_id=? AND status='pending'",(match_id,))
         with tempfile.TemporaryDirectory() as temp:
             temp_path=Path(temp); frames=[]
             for i,second in enumerate(timestamps):
@@ -553,8 +659,8 @@ def run_ai_analysis(job_id,match_id):
         message=str(exc)
         logger.exception('AI analysis failed job_id=%s match_id=%s',job_id,match_id)
         lower=message.lower()
-        if '401' in lower or 'authentication' in lower or 'api key' in lower:
-            message='AI authentication failed. The OpenAI API key needs to be replaced.'
+        if '401' in lower or '403' in lower or 'authentication' in lower or 'api key' in lower:
+            message='AI authentication failed. The configured video-analysis API key needs attention.'
         elif '429' in lower or 'rate_limit' in lower or 'quota' in lower:
             message='AI usage limit reached. Check OpenAI billing and usage limits.'
         elif 'uploaded footage' not in lower and 'duration' not in lower and 'connect to openai' not in lower:
