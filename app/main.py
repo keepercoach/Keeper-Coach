@@ -1,5 +1,5 @@
 from __future__ import annotations
-import base64, hashlib, hmac, json, os, secrets, sqlite3, subprocess, tempfile, time, urllib.request, uuid
+import base64, hashlib, hmac, json, logging, os, secrets, sqlite3, subprocess, tempfile, time, urllib.error, urllib.request, uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -18,6 +18,7 @@ STATIC = Path(__file__).resolve().parent
 DATA.mkdir(exist_ok=True); UPLOADS.mkdir(exist_ok=True)
 
 app = FastAPI(title="KeeperCoach MVP", version="1.0.0")
+logger = logging.getLogger("keepercoach.ai")
 
 SCHEMA = """
 PRAGMA foreign_keys=ON;
@@ -402,7 +403,20 @@ def openai_frame_batch(frames,goalkeeper_description):
              'text':{'format':{'type':'json_schema','name':'goalkeeper_events','strict':True,'schema':schema}}}
     req=urllib.request.Request('https://api.openai.com/v1/responses',data=json.dumps(payload).encode(),headers={
         'Authorization':f'Bearer {api_key}','Content-Type':'application/json'})
-    with urllib.request.urlopen(req,timeout=120) as response: result=json.loads(response.read())
+    try:
+        with urllib.request.urlopen(req,timeout=120) as response: result=json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        request_id=exc.headers.get('x-request-id','unknown')
+        try:
+            body=json.loads(exc.read().decode('utf-8','replace'))
+            detail=body.get('error',{})
+            error_code=detail.get('code') or detail.get('type') or 'api_error'
+            error_message=detail.get('message') or 'OpenAI rejected the request'
+        except Exception:
+            error_code='api_error'; error_message='OpenAI rejected the request'
+        raise RuntimeError(f'OpenAI API error {exc.code} ({error_code}): {error_message}; request_id={request_id}') from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f'Could not connect to OpenAI: {exc.reason}') from exc
     text=''
     for item in result.get('output',[]):
         if item.get('type')=='message':
@@ -453,8 +467,14 @@ def run_ai_analysis(job_id,match_id):
         update_analysis_job(job_id,'complete',100,'AI suggestions are ready for coach review')
     except Exception as exc:
         message=str(exc)
-        if 'api key' not in message.lower() and 'uploaded footage' not in message.lower() and 'duration' not in message.lower():
-            message='AI analysis could not be completed. Check the service logs and API configuration.'
+        logger.exception('AI analysis failed job_id=%s match_id=%s',job_id,match_id)
+        lower=message.lower()
+        if '401' in lower or 'authentication' in lower or 'api key' in lower:
+            message='AI authentication failed. The OpenAI API key needs to be replaced.'
+        elif '429' in lower or 'rate_limit' in lower or 'quota' in lower:
+            message='AI usage limit reached. Check OpenAI billing and usage limits.'
+        elif 'uploaded footage' not in lower and 'duration' not in lower and 'connect to openai' not in lower:
+            message='AI analysis failed. The detailed error has been recorded in the service logs.'
         update_analysis_job(job_id,'failed',0,message)
 
 @app.post('/api/matches/{match_id}/ai-analysis')
