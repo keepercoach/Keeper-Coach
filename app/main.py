@@ -550,30 +550,48 @@ def gemini_video_analysis(match,goalkeeper_description,job_id):
             'moments where the target goalkeeper cannot be identified at all. Never use vague phrases such as good effort, solid '
             'moment, or could improve. Scores must be integers from 1 to 10.'
         )
-        update_analysis_job(job_id,'running',55,'Watching the complete match and locating goalkeeper actions')
-        response=None
-        for attempt in range(1,5):
-            response=requests.post('https://generativelanguage.googleapis.com/v1beta/interactions',headers={
-                'x-goog-api-key':api_key,'Content-Type':'application/json'},json={'model':os.environ.get('GEMINI_VIDEO_MODEL','gemini-3.7-flash'),
-                'input':[{'type':'video','uri':uri,'mime_type':mime},{'type':'text','text':prompt}]},timeout=900)
-            if response.status_code not in (429,500,502,503,504): break
-            if attempt==4: break
-            wait_seconds=attempt*30
-            update_analysis_job(job_id,'running',55,
-                f'Video analysis service is busy — retrying automatically ({attempt}/3)')
-            time.sleep(wait_seconds)
-        response.raise_for_status(); payload=response.json()
-        texts=[]
-        def collect(value):
-            if isinstance(value,dict):
-                for key,item in value.items():
-                    if key=='text' and isinstance(item,str): texts.append(item)
-                    else: collect(item)
-            elif isinstance(value,list):
-                for item in value: collect(item)
-        collect(payload); raw='\n'.join(texts); begin=raw.find('{'); end=raw.rfind('}')
-        if begin<0 or end<=begin: raise RuntimeError('Gemini returned no structured goalkeeper analysis')
-        return json.loads(raw[begin:end+1])
+        def request_pass(pass_prompt,progress,message):
+            update_analysis_job(job_id,'running',progress,message)
+            response=None
+            for attempt in range(1,5):
+                response=requests.post('https://generativelanguage.googleapis.com/v1beta/interactions',headers={
+                    'x-goog-api-key':api_key,'Content-Type':'application/json'},json={'model':os.environ.get('GEMINI_VIDEO_MODEL','gemini-3.7-flash'),
+                    'input':[{'type':'video','uri':uri,'mime_type':mime},{'type':'text','text':pass_prompt}]},timeout=900)
+                if response.status_code not in (429,500,502,503,504): break
+                if attempt==4: break
+                update_analysis_job(job_id,'running',progress,
+                    f'Video analysis service is busy — retrying automatically ({attempt}/3)')
+                time.sleep(attempt*30)
+            response.raise_for_status(); payload=response.json(); texts=[]
+            def collect(value):
+                if isinstance(value,dict):
+                    for key,item in value.items():
+                        if key=='text' and isinstance(item,str): texts.append(item)
+                        else: collect(item)
+                elif isinstance(value,list):
+                    for item in value: collect(item)
+            collect(payload); raw='\n'.join(texts); begin=raw.find('{'); end=raw.rfind('}')
+            if begin<0 or end<=begin: raise RuntimeError('Gemini returned no structured goalkeeper analysis')
+            return json.loads(raw[begin:end+1]).get('events',[])
+
+        first_events=request_pass(prompt,55,'Watching the complete match and locating goalkeeper actions')
+        audit_prompt=prompt+(
+            ' Perform a separate high-recall audit from kickoff to full time. Look especially for moments commonly missed '
+            'in a first pass: catches and punches, low-threat saves, back-passes received, goal kicks, throws, short and long '
+            'distribution, sweeper clearances, and actions immediately before or after a cut or replay. Return every possible '
+            'target-goalkeeper involvement at confidence 0.30 or higher; a coach will reject false positives.'
+        )
+        audit_events=request_pass(audit_prompt,75,'Running a second pass for missed goalkeeper actions')
+        merged=[]
+        for event in first_events+audit_events:
+            second=parse_match_time(event.get('timestamp'))
+            duplicate=next((existing for existing in merged if existing.get('event_type')==event.get('event_type') and
+                abs(parse_match_time(existing.get('timestamp'))-second)<=8),None)
+            if duplicate:
+                if float(event.get('confidence',0))>float(duplicate.get('confidence',0)):
+                    merged[merged.index(duplicate)]=event
+            else: merged.append(event)
+        return {'events':merged}
     except requests.HTTPError as exc:
         try: detail=exc.response.json().get('error',{}).get('message')
         except Exception: detail=None
